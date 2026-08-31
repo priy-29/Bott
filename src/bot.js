@@ -1,186 +1,228 @@
 const { Telegraf, Markup } = require('telegraf');
 const { authMiddleware, encrypt } = require('./security');
 const { MainDB, TargetDB } = require('./database');
+const { runMonitoring } = require('./monitor');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+
+function esc(v) { return String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function short(v, n = 2800) { let s; try { s = JSON.stringify(v, null, 2); } catch { s = String(v); } return s.length > n ? `${s.slice(0, n)}…` : s; }
+function normalizeCollections(text) { return [...new Set(String(text).split(',').map(v => v.trim().replace(/^\/|\/$/g, '')).filter(v => /^[A-Za-z0-9_./-]+$/.test(v)))]; }
+function home() { return Markup.inlineKeyboard([[Markup.button.callback('📊 Dashboard', 'menu_dashboard'), Markup.button.callback('🗄️ Firebase Targets', 'menu_targets')], [Markup.button.callback('👁️ Monitoring', 'menu_monitoring'), Markup.button.callback('⚙️ Settings', 'menu_settings')], [Markup.button.callback('📜 Event History', 'menu_events')]]); }
+function back() { return Markup.inlineKeyboard([[Markup.button.callback('⬅️ Menu Utama', 'menu_main')]]); }
+function targetMenu(id) { return Markup.inlineKeyboard([[Markup.button.callback('👁️ Toggle Monitor', `toggle_${id}`), Markup.button.callback('📁 Collections', `coll_${id}`)], [Markup.button.callback('🔎 Inspect Data', `inspect_${id}`), Markup.button.callback('📊 Stats', `stats_${id}`)], [Markup.button.callback('🧪 Test Connection', `test_${id}`)], [Markup.button.callback('🗑️ Hapus Target', `remove_${id}`), Markup.button.callback('⬅️ Kembali', 'menu_targets')]]); }
+
+bot.use(async (ctx, next) => {
+    if (ctx.callbackQuery) {
+        try { await ctx.answerCbQuery(); } catch (error) {
+            const msg = String(error?.message || '');
+            if (!msg.includes('query is too old') && !msg.includes('query ID is invalid')) console.error('Callback ACK:', msg);
+        }
+    }
+    return next();
+});
 bot.use(authMiddleware);
 
-// Global Error Handler
-bot.catch((err, ctx) => {
-    console.error(`Error for ${ctx.updateType}:`, err);
-    ctx.reply(`❌ Terjadi kesalahan: ${err.message}`);
+bot.catch(async (error, ctx) => {
+    console.error(`Bot error [${ctx.updateType}]:`, error);
+    await MainDB.log('ERROR', `Bot error: ${ctx.updateType}`, { error: String(error?.message || error).slice(0, 500) }).catch(() => {});
+    if (ctx.callbackQuery) return;
+    try { await ctx.reply('❌ Terjadi kesalahan pada server. Silakan coba lagi.'); } catch {}
 });
 
-const mainMenu = Markup.inlineKeyboard([
-    [Markup.button.callback('📊 Dashboard', 'menu_dashboard'), Markup.button.callback('🗄️ Firebase Targets', 'menu_targets')],
-    [Markup.button.callback('👁️ Monitoring', 'menu_monitoring'), Markup.button.callback('⚙️ Settings', 'menu_settings')]
-]);
-
-const targetDetailMenu = (id) => Markup.inlineKeyboard([
-    [Markup.button.callback('👁️ Toggle Monitor', `toggle_${id}`), Markup.button.callback('📁 Set Collections', `coll_${id}`)],
-    [Markup.button.callback('🔎 Inspect Data', `inspect_${id}`), Markup.button.callback('📊 Stats', `stats_${id}`)],
-    [Markup.button.callback('🗑️ Hapus Target', `remove_${id}`), Markup.button.callback('⬅️ Kembali', 'menu_targets')]
-]);
-
-bot.start((ctx) => {
-    ctx.reply('🔥 <b>FIREBASE MONITOR PRO</b>\n\nSistem berhasil dihidupkan.', { parse_mode: 'HTML', ...mainMenu });
-});
-
-bot.action('menu_main', (ctx) => {
-    ctx.answerCbQuery();
-    ctx.editMessageText('🔥 <b>FIREBASE MONITOR PRO</b>', { parse_mode: 'HTML', ...mainMenu });
-});
-
-bot.action(['menu_dashboard', 'menu_monitoring', 'menu_settings'], (ctx) => {
-    ctx.answerCbQuery('Fitur ini akan tersedia pada pembaruan berikutnya!', { show_alert: true });
-});
-
-bot.action('menu_targets', async (ctx) => {
-    try {
-        const targets = await MainDB.getAllTargets();
-        
-        // Pindahkan penghenti loading ke bawah, agar tidak bentrok jika terjadi error
-        await ctx.answerCbQuery(); 
-
-        let text = '🗄️ <b>FIREBASE TARGETS</b>\n\n';
-        const kb = [[Markup.button.callback('➕ Tambah Firebase Baru', 'action_add_target')]];
-        
-        if (targets.length === 0) {
-            text += 'Belum ada target yang terdaftar.';
-        } else {
-            targets.forEach(t => {
-                const icon = t.monitoring?.enabled ? '🟢' : '🔴';
-                text += `${icon} <b>${t.name}</b>\n<code>${t.projectId}</code>\n\n`;
-                kb.push([Markup.button.callback(`${icon} ${t.name}`, `detail_${t.id}`)]);
-            });
-        }
-        kb.push([Markup.button.callback('🔄 Refresh', 'menu_targets'), Markup.button.callback('⬅️ Menu Utama', 'menu_main')]);
-        ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
-
-    } catch (error) {
-        console.error("Menu Targets Error:", error);
-        
-        // Tangkap error dengan aman dan kirim pesan ke obrolan
-        try { await ctx.answerCbQuery(); } catch(e){} 
-        
-        let errorMsg = error.message;
-        if (errorMsg.includes('collection')) {
-            errorMsg = "Koneksi ke Firestore Utama Gagal. Format Private Key di Vercel kemungkinan masih salah.";
-        }
-
-        ctx.reply(`❌ <b>GAGAL MEMBACA DATABASE UTAMA</b>\n\n<code>${errorMsg}</code>`, { parse_mode: 'HTML' });
+async function edit(ctx, text, markup) {
+    try { return await ctx.editMessageText(text, { parse_mode: 'HTML', ...markup }); }
+    catch (e) {
+        if (!String(e.message).includes('message is not modified')) return ctx.reply(text, { parse_mode: 'HTML', ...markup });
     }
+}
+
+async function showHome(ctx) { return edit(ctx, '🔥 <b>FIREBASE MONITOR PRO</b>\n\nKelola banyak Firebase dan pantau perubahan Firestore dari Telegram.', home()); }
+
+bot.start(ctx => ctx.reply('🔥 <b>FIREBASE MONITOR PRO</b>\n\nSistem siap digunakan.', { parse_mode: 'HTML', ...home() }));
+bot.command('menu', showHome);
+bot.action('menu_main', showHome);
+
+bot.action('menu_dashboard', async ctx => {
+    const d = await MainDB.getDashboard();
+    const stats = await MainDB.getAllStats();
+    const text = `📊 <b>DASHBOARD</b>\n\n🎯 Targets: <b>${d.targets}</b>\n🟢 Active: <b>${d.activeTargets}</b>\n📁 Collections: <b>${d.collections}</b>\n📌 Events today: <b>${d.eventsToday}</b>\n\n🟢 Created: ${d.created}\n🟡 Updated: ${d.updated}\n🔴 Deleted: ${d.deleted}\n❌ Errors: ${d.errors}\n\n📡 Firebase instances: ${Object.keys(stats).length}`;
+    return edit(ctx, text, Markup.inlineKeyboard([[Markup.button.callback('🔄 Refresh', 'menu_dashboard')], [Markup.button.callback('⬅️ Menu Utama', 'menu_main')]]));
 });
 
+bot.action('menu_targets', async ctx => {
+    const targets = await MainDB.getAllTargets();
+    let text = '🗄️ <b>FIREBASE TARGETS</b>\n\n';
+    const rows = [[Markup.button.callback('➕ Tambah Firebase Baru', 'action_add_target')]];
+    if (!targets.length) text += 'Belum ada target.\n';
+    for (const t of targets) {
+        const icon = t.monitoring?.enabled ? '🟢' : '🔴';
+        text += `${icon} <b>${esc(t.name)}</b>\n<code>${esc(t.projectId)}</code>\n📁 ${t.monitoring?.collections?.length || 0} collection\n\n`;
+        rows.push([Markup.button.callback(`${icon} ${String(t.name).slice(0, 30)}`, `detail_${t.id}`)]);
+    }
+    rows.push([Markup.button.callback('🔄 Refresh', 'menu_targets'), Markup.button.callback('⬅️ Menu Utama', 'menu_main')]);
+    return edit(ctx, text, { reply_markup: { inline_keyboard: rows } });
+});
 
-bot.action('action_add_target', async (ctx) => {
-    await ctx.answerCbQuery();
+bot.action('action_add_target', async ctx => {
     await MainDB.setState(ctx.from.id, { step: 'AWAITING_NAME' });
-    ctx.reply('📝 <b>Masukkan NAMA untuk Firebase target ini:</b>\n\n(Contoh: Dirvi Gallery)', { parse_mode: 'HTML' });
+    return ctx.reply('📝 <b>Nama Firebase target</b>\n\nContoh: Production App', { parse_mode: 'HTML' });
 });
 
-bot.action(/detail_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
+bot.action(/detail_(.+)/, async ctx => {
     const target = await MainDB.getTarget(ctx.match[1]);
-    if (!target) return ctx.editMessageText('Target tidak ditemukan.', { ...mainMenu });
-    
-    const status = target.monitoring?.enabled ? '🟢 ON' : '🔴 OFF';
-    const collections = target.monitoring?.collections?.length ? target.monitoring.collections.join(', ') : 'Belum diatur';
-    
-    ctx.editMessageText(`🗄️ <b>${target.name}</b>\n\n📦 Project ID: <code>${target.projectId}</code>\n👁️ Monitoring: ${status}\n📁 Collections: <code>${collections}</code>`, 
-    { parse_mode: 'HTML', ...targetDetailMenu(target.id) });
-});
-
-bot.action(/toggle_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const target = await MainDB.getTarget(ctx.match[1]);
-    if (!target) return;
-    
-    const newState = !target.monitoring?.enabled;
+    if (!target) return edit(ctx, '❌ Target tidak ditemukan.', back());
     const collections = target.monitoring?.collections || [];
-    await MainDB.updateTargetMonitoring(target.id, newState, collections);
-    
-    bot.handleUpdate({ update_id: ctx.update.update_id, callback_query: { ...ctx.update.callback_query, data: `detail_${target.id}` } });
+    return edit(ctx, `🗄️ <b>${esc(target.name)}</b>\n\n📦 Project: <code>${esc(target.projectId)}</code>\n👁️ Monitoring: ${target.monitoring?.enabled ? '🟢 ON' : '🔴 OFF'}\n📁 Collections: ${collections.length ? `<code>${esc(collections.join(', '))}</code>` : 'Belum diatur'}`, targetMenu(target.id));
 });
 
-bot.action(/coll_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await MainDB.setState(ctx.from.id, { step: 'AWAITING_COLLECTION', targetId: ctx.match[1] });
-    ctx.reply('📝 <b>Ketik nama collection yang ingin dipantau.</b>\nJika lebih dari satu, pisahkan dengan koma.\n\nContoh: <code>users, orders, settings</code>', { parse_mode: 'HTML' });
+bot.action(/toggle_(.+)/, async ctx => {
+    const target = await MainDB.getTarget(ctx.match[1]);
+    if (!target) return edit(ctx, '❌ Target tidak ditemukan.', back());
+    const enabled = !target.monitoring?.enabled;
+    await MainDB.updateTargetMonitoring(target.id, enabled, target.monitoring?.collections || []);
+    return edit(ctx, `👁️ Monitoring sekarang <b>${enabled ? '🟢 ON' : '🔴 OFF'}</b>`, targetMenu(target.id));
 });
 
-bot.action(/inspect_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery('Fitur inspeksi data (query) segera hadir!');
+bot.action(/coll_(.+)/, async ctx => {
+    const target = await MainDB.getTarget(ctx.match[1]);
+    if (!target) return edit(ctx, '❌ Target tidak ditemukan.', back());
+    await MainDB.setState(ctx.from.id, { step: 'AWAITING_COLLECTION', targetId: target.id });
+    return ctx.reply(`📁 <b>Collection untuk ${esc(target.name)}</b>\n\nPisahkan dengan koma.\nContoh: <code>users, orders, settings</code>`, { parse_mode: 'HTML' });
 });
 
-bot.action(/stats_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery('Fitur statistik detail segera hadir!');
+bot.action(/inspect_(.+)/, async ctx => {
+    const target = await MainDB.getTarget(ctx.match[1]);
+    if (!target) return edit(ctx, '❌ Target tidak ditemukan.', back());
+    const cols = await TargetDB.listCollections(target.id);
+    const rows = cols.slice(0, 40).map(c => [Markup.button.callback(`📁 ${c.slice(0, 45)}`, `ilist_${target.id}_${encodeURIComponent(c).slice(0, 35)}`)]);
+    rows.push([Markup.button.callback('🔍 Search Document', `searchdoc_${target.id}`)], [Markup.button.callback('⬅️ Kembali', `detail_${target.id}`)]);
+    return edit(ctx, `🔎 <b>INSPECT DATA</b>\n\nTarget: <b>${esc(target.name)}</b>\n\nPilih collection:`, { reply_markup: { inline_keyboard: rows } });
 });
 
-bot.action(/remove_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const id = ctx.match[1];
-    ctx.editMessageText(`⚠️ <b>KONFIRMASI PENGHAPUSAN</b>\n\nAnda yakin ingin menghapus target ini beserta seluruh konfigurasi dan snapshot-nya?`, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[Markup.button.callback('❌ Batal', `detail_${id}`), Markup.button.callback('✅ Hapus Permanen', `confirm_remove_${id}`)]] }
-    });
+bot.action(/ilist_([^_]+)_(.+)/, async ctx => {
+    const targetId = ctx.match[1];
+    const collection = decodeURIComponent(ctx.match[2]);
+    const result = await TargetDB.listDocuments(targetId, collection, 10);
+    const rows = result.docs.map(d => [Markup.button.callback(`📄 ${String(d.id).slice(0, 45)}`, `view_${targetId}_${encodeURIComponent(collection).slice(0, 30)}_${encodeURIComponent(d.id).slice(0, 20)}`)]);
+    rows.push([Markup.button.callback('🔍 Search Field', `searchfield_${targetId}_${encodeURIComponent(collection).slice(0, 30)}`)], [Markup.button.callback('⬅️ Collections', `inspect_${targetId}`)]);
+    const text = `📁 <b>${esc(collection)}</b>\n\n${result.docs.length ? result.docs.map((d, i) => `${i + 1}. <code>${esc(d.id)}</code>`).join('\n') : 'Collection kosong.'}`;
+    return edit(ctx, text, { reply_markup: { inline_keyboard: rows } });
 });
 
-bot.action(/confirm_remove_(.+)/, async (ctx) => {
-    await ctx.answerCbQuery('✅ Target dihapus secara permanen.');
-    await MainDB.deleteTarget(ctx.match[1]);
-    bot.handleUpdate({ update_id: ctx.update.update_id, callback_query: { ...ctx.update.callback_query, data: 'menu_targets' } });
+bot.action(/view_([^_]+)_([^_]+)_(.+)/, async ctx => {
+    const targetId = ctx.match[1];
+    const collection = decodeURIComponent(ctx.match[2]);
+    const documentId = decodeURIComponent(ctx.match[3]);
+    const doc = await TargetDB.getDocument(targetId, collection, documentId);
+    if (!doc) return edit(ctx, '❌ Document tidak ditemukan.', { reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Kembali', `inspect_${targetId}`)]] } });
+    return edit(ctx, `📄 <b>${esc(collection)} / ${esc(doc.id)}</b>\n\n<pre>${esc(short(doc.data))}</pre>`, { reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Kembali', `inspect_${targetId}`)]] } });
 });
 
-bot.on('text', async (ctx, next) => {
+bot.action(/searchdoc_(.+)/, async ctx => {
+    await MainDB.setState(ctx.from.id, { step: 'AWAITING_DOCUMENT_ID', targetId: ctx.match[1] });
+    return ctx.reply('🔍 Kirim dalam format:\n<code>collection/documentId</code>', { parse_mode: 'HTML' });
+});
+
+bot.action(/searchfield_([^_]+)_(.+)/, async ctx => {
+    await MainDB.setState(ctx.from.id, { step: 'AWAITING_FIELD_SEARCH', targetId: ctx.match[1], collection: decodeURIComponent(ctx.match[2]) });
+    return ctx.reply('🔍 Kirim dalam format:\n<code>field=value</code>\n\nContoh: <code>email=test@gmail.com</code>', { parse_mode: 'HTML' });
+});
+
+bot.action(/stats_(.+)/, async ctx => {
+    const target = await MainDB.getTarget(ctx.match[1]);
+    if (!target) return edit(ctx, '❌ Target tidak ditemukan.', back());
+    const s = await MainDB.getStats(target.id);
+    return edit(ctx, `📊 <b>STATS — ${esc(target.name)}</b>\n\n🟢 Created: ${s.create || 0}\n🟡 Updated: ${s.update || 0}\n🔴 Deleted: ${s.delete || 0}\n❌ Errors: ${s.errors || 0}\n\n🕒 Last update: ${s.updatedAt ? new Date(s.updatedAt).toLocaleString('id-ID') : '-'}`, { reply_markup: { inline_keyboard: [[Markup.button.callback('🔄 Refresh', `stats_${target.id}`)], [Markup.button.callback('⬅️ Kembali', `detail_${target.id}`)]] } });
+});
+
+bot.action(/test_(.+)/, async ctx => {
+    const target = await MainDB.getTarget(ctx.match[1]);
+    if (!target) return edit(ctx, '❌ Target tidak ditemukan.', back());
+    const started = Date.now();
+    try {
+        await TargetDB.listCollections(target.id);
+        return edit(ctx, `🟢 <b>CONNECTION OK</b>\n\nProject: <code>${esc(target.projectId)}</code>\nLatency: <b>${Date.now() - started} ms</b>`, targetMenu(target.id));
+    } catch (error) {
+        return edit(ctx, `🔴 <b>CONNECTION FAILED</b>\n\n${esc(String(error.message || 'Koneksi gagal'))}`, targetMenu(target.id));
+    }
+});
+
+bot.action(/remove_(.+)/, async ctx => edit(ctx, '⚠️ <b>KONFIRMASI PENGHAPUSAN</b>\n\nSemua konfigurasi dan snapshot target akan dihapus.', { reply_markup: { inline_keyboard: [[Markup.button.callback('❌ Batal', `detail_${ctx.match[1]}`), Markup.button.callback('✅ Hapus Permanen', `confirm_remove_${ctx.match[1]}`)]] } }));
+bot.action(/confirm_remove_(.+)/, async ctx => { await MainDB.deleteTarget(ctx.match[1]); return edit(ctx, '✅ Target berhasil dihapus.', { ...home() }); });
+
+bot.action('menu_monitoring', async ctx => {
+    const targets = await MainDB.getAllTargets();
+    const rows = targets.map(t => [Markup.button.callback(`${t.monitoring?.enabled ? '🟢' : '🔴'} ${String(t.name).slice(0, 35)}`, `detail_${t.id}`)]);
+    rows.push([Markup.button.callback('🔄 Scan Semua Sekarang', 'scan_all')], [Markup.button.callback('⬅️ Menu Utama', 'menu_main')]);
+    return edit(ctx, `👁️ <b>MONITORING</b>\n\n🟢 Aktif: ${targets.filter(t => t.monitoring?.enabled).length}/${targets.length}\n\nPilih target atau jalankan scan manual.`, { reply_markup: { inline_keyboard: rows } });
+});
+bot.action('scan_all', async ctx => { const result = await runMonitoring({ force: true }); const total = result.results.reduce((n, r) => n + Number(r.changes || 0), 0); return edit(ctx, `🔄 <b>SCAN SELESAI</b>\n\nTarget diproses: ${result.results.length}\nPerubahan: ${total}\nDurasi: ${result.duration} ms`, { reply_markup: { inline_keyboard: [[Markup.button.callback('🔄 Scan Lagi', 'scan_all')], [Markup.button.callback('⬅️ Monitoring', 'menu_monitoring')]] } }); });
+
+bot.action('menu_events', async ctx => {
+    const events = await MainDB.getEvents({ limit: 15 });
+    const text = `📜 <b>EVENT HISTORY</b>\n\n${events.length ? events.map(e => `${e.action === 'CREATE' ? '🟢' : e.action === 'UPDATE' ? '🟡' : '🔴'} <b>${esc(e.collection)}</b> / <code>${esc(e.document)}</code>\n${new Date(e.createdAt).toLocaleString('id-ID')}`).join('\n\n') : 'Belum ada event.'}`;
+    return edit(ctx, text, { reply_markup: { inline_keyboard: [[Markup.button.callback('🔄 Refresh', 'menu_events')], [Markup.button.callback('⬅️ Menu Utama', 'menu_main')]] } });
+});
+
+bot.action('menu_settings', async ctx => {
+    const s = await MainDB.getSystemSettings();
+    return edit(ctx, `⚙️ <b>SETTINGS</b>\n\n⏱ Interval default: ${Math.round(Number(s.intervalMs || 300000) / 60000)} menit\n📦 Max docs/scan: ${s.maxDocs || 1000}\n🔔 Notifications: ${s.notifications === false ? '🔴 OFF' : '🟢 ON'}\n📦 Batch size: ${s.batchSize || 200}`, { reply_markup: { inline_keyboard: [[Markup.button.callback('🔔 Toggle Notifications', 'settings_notify')], [Markup.button.callback('⚡ Scan Sekarang', 'scan_all')], [Markup.button.callback('⬅️ Menu Utama', 'menu_main')]] } });
+});
+bot.action('settings_notify', async ctx => { const s = await MainDB.getSystemSettings(); await MainDB.setSystemSettings({ notifications: s.notifications === false }); return bot.telegram.editMessageText(ctx.chat.id, ctx.callbackQuery.message.message_id, undefined, '⚙️ Settings diperbarui.', { parse_mode: 'HTML', ...back() }); });
+
+bot.on('text', async ctx => {
     const state = await MainDB.getState(ctx.from.id);
-    if (!state) return next();
-
-    if (state.step === 'AWAITING_NAME') {
-        await MainDB.setState(ctx.from.id, { step: 'AWAITING_JSON', targetName: ctx.message.text });
-        return ctx.reply(`Nama Tersimpan: <b>${ctx.message.text}</b>\n\n🔑 <b>Sekarang, paste isi JSON Service Account Firebase tersebut.</b>\n\nPastikan Anda menyalin semuanya dari kurung kurawal pembuka hingga penutup.`, { parse_mode: 'HTML' });
-    }
-
-    if (state.step === 'AWAITING_JSON') {
-        try {
-            const creds = JSON.parse(ctx.message.text);
-            if (!creds.project_id || !creds.private_key) throw new Error('Format JSON Service Account tidak valid.');
-            
-            const testMsg = await ctx.reply('⏳ Menguji koneksi target...');
-            const result = await TargetDB.testConnection(creds);
-            
-            if (result.success) {
-                const targetData = {
-                    id: `db_${Date.now()}`,
-                    name: state.targetName,
-                    projectId: result.projectId,
-                    credentialEncrypted: encrypt(ctx.message.text),
-                    monitoring: { enabled: false, collections: [] }
-                };
-                await MainDB.addTarget(targetData);
-                await MainDB.clearState(ctx.from.id);
-                try { await ctx.deleteMessage(ctx.message.message_id); } catch(e){} 
-                ctx.telegram.editMessageText(ctx.chat.id, testMsg.message_id, null, `✅ <b>TARGET BERHASIL DITAMBAHKAN</b>\n\nNama: <b>${targetData.name}</b>\nProject: <code>${targetData.projectId}</code>\n\nSilakan masuk ke menu Target untuk mengatur Collection.`, { parse_mode: 'HTML' });
-            } else {
-                await MainDB.clearState(ctx.from.id);
-                ctx.reply(`❌ Koneksi gagal: ${result.error}`);
-            }
-        } catch (err) {
+    if (!state) return;
+    const input = ctx.message.text.trim();
+    try {
+        if (state.step === 'AWAITING_NAME') {
+            if (!input || input.length > 80) return ctx.reply('❌ Nama tidak valid. Maksimal 80 karakter.');
+            await MainDB.setState(ctx.from.id, { step: 'AWAITING_JSON', targetName: input });
+            return ctx.reply('🔑 Paste JSON Service Account Firebase. Pesan credential akan dihapus setelah diproses.');
+        }
+        if (state.step === 'AWAITING_JSON') {
+            let creds;
+            try { creds = JSON.parse(input); } catch { return ctx.reply('❌ JSON tidak valid. Kirim ulang JSON Service Account.'); }
+            const test = await TargetDB.testConnection(creds);
+            if (!test.success) return ctx.reply(`❌ Koneksi gagal: ${esc(test.error)}`, { parse_mode: 'HTML' });
+            const target = { id: `db_${Date.now()}`, name: state.targetName, projectId: test.projectId, credentialEncrypted: encrypt(input), monitoring: { enabled: false, collections: [] } };
+            await MainDB.addTarget(target);
             await MainDB.clearState(ctx.from.id);
-            ctx.reply(`❌ Validasi gagal: ${err.message}\nSilakan ulangi proses penambahan dari awal.`);
+            try { await ctx.deleteMessage(ctx.message.message_id); } catch {}
+            return ctx.reply(`✅ <b>Target berhasil ditambahkan</b>\n\nNama: ${esc(target.name)}\nProject: <code>${esc(target.projectId)}</code>\nLatency test: ${test.latency} ms`, { parse_mode: 'HTML', ...home() });
         }
-    }
-
-    if (state.step === 'AWAITING_COLLECTION') {
-        const collections = ctx.message.text.split(',').map(s => s.trim()).filter(s => s);
-        const target = await MainDB.getTarget(state.targetId);
-        
-        if (target) {
+        if (state.step === 'AWAITING_COLLECTION') {
+            const collections = normalizeCollections(input);
+            if (!collections.length) return ctx.reply('❌ Collection tidak valid. Contoh: users, orders');
+            const target = await MainDB.getTarget(state.targetId);
+            if (!target) return ctx.reply('❌ Target tidak ditemukan.');
             await MainDB.updateTargetMonitoring(target.id, target.monitoring?.enabled || false, collections);
-            ctx.reply(`✅ <b>Collection tersimpan:</b>\n<code>${collections.join(', ')}</code>`, { parse_mode: 'HTML' });
+            await MainDB.clearState(ctx.from.id);
+            return ctx.reply(`✅ Collection tersimpan:\n<code>${esc(collections.join(', '))}</code>`, { parse_mode: 'HTML' });
         }
-        await MainDB.clearState(ctx.from.id);
+        if (state.step === 'AWAITING_DOCUMENT_ID') {
+            const [collection, ...idParts] = input.split('/');
+            const documentId = idParts.join('/');
+            if (!collection || !documentId) return ctx.reply('❌ Format salah. Gunakan collection/documentId');
+            const doc = await TargetDB.getDocument(state.targetId, collection, documentId);
+            await MainDB.clearState(ctx.from.id);
+            return ctx.reply(doc ? `📄 <b>${esc(collection)}/${esc(doc.id)}</b>\n\n<pre>${esc(short(doc.data))}</pre>` : '❌ Document tidak ditemukan.', { parse_mode: 'HTML' });
+        }
+        if (state.step === 'AWAITING_FIELD_SEARCH') {
+            const index = input.indexOf('=');
+            if (index < 1) return ctx.reply('❌ Format salah. Gunakan field=value');
+            const field = input.slice(0, index).trim(); const value = input.slice(index + 1).trim();
+            const results = await TargetDB.searchDocuments(state.targetId, state.collection, field, value, 20);
+            await MainDB.clearState(ctx.from.id);
+            return ctx.reply(`🔎 <b>HASIL SEARCH</b>\n\n${results.length ? results.map(d => `• <code>${esc(d.id)}</code>`).join('\n') : 'Tidak ditemukan.'}`, { parse_mode: 'HTML' });
+        }
+    } catch (error) {
+        await MainDB.clearState(ctx.from.id).catch(() => {});
+        await MainDB.log('ERROR', 'Text handler failed', { error: error.message }).catch(() => {});
+        return ctx.reply('❌ Permintaan gagal diproses. Coba lagi.');
     }
 });
 
 module.exports = bot;
+                             
