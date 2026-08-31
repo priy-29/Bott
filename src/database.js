@@ -1,29 +1,27 @@
 const admin = require('firebase-admin');
 const { decrypt } = require('./security');
 
-// ==========================================
-// 1. INISIALISASI DATABASE UTAMA BOT
-// ==========================================
+// Formatting Private Key secara paksa agar kebal dari error Vercel
+let pk = process.env.BOT_FIREBASE_PRIVATE_KEY || '';
+pk = pk.split(String.raw`\n`).join('\n').replace(/\\n/g, '\n');
+
 let mainDb;
 try {
-    const mainApp = admin.initializeApp({
-        credential: admin.credential.cert({
-            projectId: process.env.BOT_FIREBASE_PROJECT_ID,
-            clientEmail: process.env.BOT_FIREBASE_CLIENT_EMAIL,
-            privateKey: process.env.BOT_FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
-        })
-    }, 'MAIN_BOT_DB'); // Isolasi nama instance
-    mainDb = mainApp.firestore();
+    if (!admin.apps.length) {
+        admin.initializeApp({
+            credential: admin.credential.cert({
+                projectId: process.env.BOT_FIREBASE_PROJECT_ID,
+                clientEmail: process.env.BOT_FIREBASE_CLIENT_EMAIL,
+                privateKey: pk
+            })
+        });
+    }
+    mainDb = admin.firestore();
 } catch (error) {
-    if (!/already exists/i.test(error.message)) throw error;
-    mainDb = admin.app('MAIN_BOT_DB').firestore();
+    console.error("FATAL ERROR DB INIT:", error);
 }
 
-// ==========================================
-// 2. ABSTRAKSI DATABASE UTAMA BOT
-// ==========================================
 const MainDB = {
-    // State Management untuk Bot Telegram (karena Vercel stateless)
     async setState(userId, stateData) {
         await mainDb.collection('botStates').doc(userId.toString()).set(stateData);
     },
@@ -34,8 +32,6 @@ const MainDB = {
     async clearState(userId) {
         await mainDb.collection('botStates').doc(userId.toString()).delete();
     },
-
-    // Target Management
     async addTarget(targetData) {
         await mainDb.collection('firebaseTargets').doc(targetData.id).set(targetData);
     },
@@ -51,8 +47,12 @@ const MainDB = {
         await mainDb.collection('firebaseTargets').doc(targetId).delete();
         await mainDb.collection('snapshots').doc(targetId).delete();
     },
-
-    // Monitoring & Snapshots
+    async updateTargetMonitoring(targetId, enabled, collections = []) {
+        await mainDb.collection('firebaseTargets').doc(targetId).update({
+            'monitoring.enabled': enabled,
+            'monitoring.collections': collections
+        });
+    },
     async getSnapshot(targetId, collection) {
         const doc = await mainDb.collection('snapshots').doc(`${targetId}_${collection}`).get();
         return doc.exists ? doc.data().data : {};
@@ -66,13 +66,10 @@ const MainDB = {
     }
 };
 
-// ==========================================
-// 3. ABSTRAKSI FIREBASE TARGET (TERISOLASI)
-// ==========================================
 const TargetDB = {
     async getTargetFirestore(targetId) {
         const targetData = await MainDB.getTarget(targetId);
-        if (!targetData) throw new Error('Target tidak ditemukan di Database Utama');
+        if (!targetData) throw new Error('Target tidak ditemukan.');
 
         const appName = `TARGET_${targetId}`;
         const existingApp = admin.apps.find(app => app && app.name === appName);
@@ -94,9 +91,8 @@ const TargetDB = {
                 credential: admin.credential.cert(credsRaw),
                 projectId: credsRaw.project_id
             }, tempAppId);
-            
             const db = app.firestore();
-            await db.listCollections(); // Test validitas token & akses
+            await db.listCollections(); 
             await app.delete();
             return { success: true, projectId: credsRaw.project_id };
         } catch (error) {
