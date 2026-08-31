@@ -1,40 +1,54 @@
-
 const crypto = require('crypto');
 
-const ALGORITHM = 'aes-256-cbc';
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; 
-const IV_LENGTH = 16;
-const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim());
+const ALGORITHM = 'aes-256-gcm';
+const IV_LENGTH = 12;
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(v => v.trim()).filter(Boolean);
 
-if (!ENCRYPTION_KEY || Buffer.from(ENCRYPTION_KEY).length !== 32) {
-    throw new Error('FATAL: ENCRYPTION_KEY must be exactly 32 bytes.');
+function keyBuffer() {
+    if (!ENCRYPTION_KEY) throw new Error('ENCRYPTION_KEY is required.');
+    const raw = Buffer.from(ENCRYPTION_KEY, 'utf8');
+    if (raw.length !== 32) throw new Error('ENCRYPTION_KEY must be exactly 32 bytes.');
+    return raw;
 }
 
 function encrypt(text) {
     const iv = crypto.randomBytes(IV_LENGTH);
-    const cipher = crypto.createCipheriv(ALGORITHM, Buffer.from(ENCRYPTION_KEY), iv);
-    let encrypted = cipher.update(text);
-    encrypted = Buffer.concat([encrypted, cipher.final()]);
-    return iv.toString('hex') + ':' + encrypted.toString('hex');
+    const cipher = crypto.createCipheriv(ALGORITHM, keyBuffer(), iv);
+    const encrypted = Buffer.concat([cipher.update(String(text), 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
 }
 
-function decrypt(text) {
-    const textParts = text.split(':');
-    const iv = Buffer.from(textParts.shift(), 'hex');
-    const encryptedText = Buffer.from(textParts.join(':'), 'hex');
-    const decipher = crypto.createDecipheriv(ALGORITHM, Buffer.from(ENCRYPTION_KEY), iv);
-    let decrypted = decipher.update(encryptedText);
-    decrypted = Buffer.concat([decrypted, decipher.final()]);
-    return decrypted.toString();
+function decrypt(value) {
+    if (!value) throw new Error('Encrypted value is empty.');
+    const parts = String(value).split(':');
+    if (parts.length === 2) {
+        const iv = Buffer.from(parts[0], 'hex');
+        const encrypted = Buffer.from(parts[1], 'hex');
+        const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuffer(), iv);
+        return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+    }
+    if (parts.length !== 3) throw new Error('Invalid encrypted value.');
+    const iv = Buffer.from(parts[0], 'hex');
+    const tag = Buffer.from(parts[1], 'hex');
+    const encrypted = Buffer.from(parts[2], 'hex');
+    const decipher = crypto.createDecipheriv(ALGORITHM, keyBuffer(), iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
 }
 
 function isAuthorized(userId) {
-    return ADMIN_IDS.includes(userId?.toString());
+    return ADMIN_IDS.includes(String(userId || ''));
 }
 
-const authMiddleware = (ctx, next) => {
+async function authMiddleware(ctx, next) {
     if (isAuthorized(ctx.from?.id)) return next();
-    return ctx.reply('⛔ Akses ditolak. Anda tidak terdaftar sebagai admin.');
-};
+    if (ctx.callbackQuery) {
+        try { await ctx.answerCbQuery('Akses ditolak.', { show_alert: true }); } catch {}
+        return;
+    }
+    if (ctx.from) return ctx.reply('⛔ Akses ditolak. Anda tidak terdaftar sebagai admin.');
+}
 
 module.exports = { encrypt, decrypt, isAuthorized, authMiddleware, ADMIN_IDS };
