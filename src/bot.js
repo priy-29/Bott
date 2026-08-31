@@ -37,8 +37,11 @@ bot.action(['menu_dashboard', 'menu_monitoring', 'menu_settings'], (ctx) => {
 
 bot.action('menu_targets', async (ctx) => {
     try {
-        await ctx.answerCbQuery();
         const targets = await MainDB.getAllTargets();
+        
+        // Pindahkan penghenti loading ke bawah, agar tidak bentrok jika terjadi error
+        await ctx.answerCbQuery(); 
+
         let text = '🗄️ <b>FIREBASE TARGETS</b>\n\n';
         const kb = [[Markup.button.callback('➕ Tambah Firebase Baru', 'action_add_target')]];
         
@@ -53,11 +56,22 @@ bot.action('menu_targets', async (ctx) => {
         }
         kb.push([Markup.button.callback('🔄 Refresh', 'menu_targets'), Markup.button.callback('⬅️ Menu Utama', 'menu_main')]);
         ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+
     } catch (error) {
-        ctx.answerCbQuery('Gagal membaca database utama.');
-        ctx.reply(`❌ <b>DB ERROR:</b>\n<code>${error.message}</code>`, { parse_mode: 'HTML' });
+        console.error("Menu Targets Error:", error);
+        
+        // Tangkap error dengan aman dan kirim pesan ke obrolan
+        try { await ctx.answerCbQuery(); } catch(e){} 
+        
+        let errorMsg = error.message;
+        if (errorMsg.includes('collection')) {
+            errorMsg = "Koneksi ke Firestore Utama Gagal. Format Private Key di Vercel kemungkinan masih salah.";
+        }
+
+        ctx.reply(`❌ <b>GAGAL MEMBACA DATABASE UTAMA</b>\n\n<code>${errorMsg}</code>`, { parse_mode: 'HTML' });
     }
 });
+
 
 bot.action('action_add_target', async (ctx) => {
     await ctx.answerCbQuery();
