@@ -7,11 +7,9 @@ export default async function handler(req, res) {
             res.status(200).send('OK');
         } catch (error) {
             console.error('Webhook error:', error);
-            res.status(500).send('Error processing webhook');
+            res.status(500).send('Error');
         }
     } else {
-        const url = `https://${req.headers.host}/api/webhook`;
-        await bot.telegram.setWebhook(url);
-        res.status(200).send(`Webhook configured to ${url}`);
+        res.status(200).send(`Webhook is active for Vercel Serverless.`);
     }
 }
