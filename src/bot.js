@@ -8,6 +8,8 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 function esc(v) { return String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 function short(v, n = 2800) { let s; try { s = JSON.stringify(v, null, 2); } catch { s = String(v); } return s.length > n ? `${s.slice(0, n)}…` : s; }
 function normalizeCollections(text) { return [...new Set(String(text).split(',').map(v => v.trim().replace(/^\/|\/$/g, '')).filter(v => /^[A-Za-z0-9_./-]+$/.test(v)))]; }
+function enc(v) { return Buffer.from(String(v), 'utf8').toString('base64url'); }
+function dec(v) { return Buffer.from(String(v), 'base64url').toString('utf8'); }
 function home() { return Markup.inlineKeyboard([[Markup.button.callback('📊 Dashboard', 'menu_dashboard'), Markup.button.callback('🗄️ Firebase Targets', 'menu_targets')], [Markup.button.callback('👁️ Monitoring', 'menu_monitoring'), Markup.button.callback('⚙️ Settings', 'menu_settings')], [Markup.button.callback('📜 Event History', 'menu_events')]]); }
 function back() { return Markup.inlineKeyboard([[Markup.button.callback('⬅️ Menu Utama', 'menu_main')]]); }
 function targetMenu(id) { return Markup.inlineKeyboard([[Markup.button.callback('👁️ Toggle Monitor', `toggle_${id}`), Markup.button.callback('📁 Collections', `coll_${id}`)], [Markup.button.callback('🔎 Inspect Data', `inspect_${id}`), Markup.button.callback('📊 Stats', `stats_${id}`)], [Markup.button.callback('🧪 Test Connection', `test_${id}`)], [Markup.button.callback('🗑️ Hapus Target', `remove_${id}`), Markup.button.callback('⬅️ Kembali', 'menu_targets')]]); }
@@ -24,9 +26,13 @@ bot.use(async (ctx, next) => {
 bot.use(authMiddleware);
 
 bot.catch(async (error, ctx) => {
+    const message = String(error?.message || error || '');
     console.error(`Bot error [${ctx.updateType}]:`, error);
-    await MainDB.log('ERROR', `Bot error: ${ctx.updateType}`, { error: String(error?.message || error).slice(0, 500) }).catch(() => {});
-    if (ctx.callbackQuery) return;
+    await MainDB.log('ERROR', `Bot error: ${ctx.updateType}`, { error: message.slice(0, 500) }).catch(() => {});
+    if (ctx.callbackQuery) {
+        try { await ctx.reply('❌ Permintaan gagal diproses. Silakan buka menu lagi.'); } catch {}
+        return;
+    }
     try { await ctx.reply('❌ Terjadi kesalahan pada server. Silakan coba lagi.'); } catch {}
 });
 
@@ -94,38 +100,78 @@ bot.action(/coll_(.+)/, async ctx => {
 bot.action(/inspect_(.+)/, async ctx => {
     const target = await MainDB.getTarget(ctx.match[1]);
     if (!target) return edit(ctx, '❌ Target tidak ditemukan.', back());
-    const cols = await TargetDB.listCollections(target.id);
-    const rows = cols.slice(0, 40).map(c => [Markup.button.callback(`📁 ${c.slice(0, 45)}`, `ilist_${target.id}_${encodeURIComponent(c).slice(0, 35)}`)]);
-    rows.push([Markup.button.callback('🔍 Search Document', `searchdoc_${target.id}`)], [Markup.button.callback('⬅️ Kembali', `detail_${target.id}`)]);
-    return edit(ctx, `🔎 <b>INSPECT DATA</b>\n\nTarget: <b>${esc(target.name)}</b>\n\nPilih collection:`, { reply_markup: { inline_keyboard: rows } });
+    try {
+        const cols = await TargetDB.listCollections(target.id);
+        const rows = cols.slice(0, 40).map(c => [Markup.button.callback(`📁 ${c.slice(0, 45)}`, `ilist.${enc(target.id)}.${enc(c)}`)]);
+        rows.push([Markup.button.callback('🔍 Search Document', `searchdoc_${enc(target.id)}`)], [Markup.button.callback('⬅️ Kembali', `detail_${target.id}`)]);
+        return edit(ctx, `🔎 <b>INSPECT DATA</b>\n\nTarget: <b>${esc(target.name)}</b>\n\nPilih collection:`, { reply_markup: { inline_keyboard: rows } });
+    } catch (error) {
+        console.error('Inspect error:', error);
+        return edit(ctx, `❌ <b>Gagal mengambil collection</b>\n\n${esc(error?.message || 'Firebase error')}`, back());
+    }
 });
 
-bot.action(/ilist_([^_]+)_(.+)/, async ctx => {
-    const targetId = ctx.match[1];
-    const collection = decodeURIComponent(ctx.match[2]);
-    const result = await TargetDB.listDocuments(targetId, collection, 10);
-    const rows = result.docs.map(d => [Markup.button.callback(`📄 ${String(d.id).slice(0, 45)}`, `view_${targetId}_${encodeURIComponent(collection).slice(0, 30)}_${encodeURIComponent(d.id).slice(0, 20)}`)]);
-    rows.push([Markup.button.callback('🔍 Search Field', `searchfield_${targetId}_${encodeURIComponent(collection).slice(0, 30)}`)], [Markup.button.callback('⬅️ Collections', `inspect_${targetId}`)]);
-    const text = `📁 <b>${esc(collection)}</b>\n\n${result.docs.length ? result.docs.map((d, i) => `${i + 1}. <code>${esc(d.id)}</code>`).join('\n') : 'Collection kosong.'}`;
-    return edit(ctx, text, { reply_markup: { inline_keyboard: rows } });
+bot.action(/^ilist\.(.+)$/, async ctx => {
+    const parts = String(ctx.match[1]).split('.');
+    if (parts.length < 2) return ctx.reply('❌ Data tombol tidak valid. Buka Inspect Data lagi.');
+    const targetId = dec(parts.shift());
+    const collection = dec(parts.join('.'));
+    try {
+        const target = await MainDB.getTarget(targetId);
+        if (!target) return edit(ctx, '❌ Target tidak ditemukan.', back());
+        const result = await TargetDB.listDocuments(targetId, collection, 10);
+        const rows = result.docs.map(d => [Markup.button.callback(`📄 ${String(d.id).slice(0, 45)}`, `view.${enc(targetId)}.${enc(collection)}.${enc(d.id)}`)]);
+        if (result.hasMore && result.nextCursor) rows.push([Markup.button.callback('➡️ Berikutnya', `ilistpage.${enc(targetId)}.${enc(collection)}.${enc(result.nextCursor)}`)]);
+        rows.push([Markup.button.callback('🔍 Search Field', `searchfield.${enc(targetId)}.${enc(collection)}`)], [Markup.button.callback('⬅️ Collections', `inspect_${targetId}`)]);
+        const text = `📁 <b>${esc(collection)}</b>\n\n${result.docs.length ? result.docs.map((d, i) => `${i + 1}. <code>${esc(d.id)}</code>`).join('\n') : 'Collection kosong.'}`;
+        return edit(ctx, text, { reply_markup: { inline_keyboard: rows } });
+    } catch (error) {
+        console.error('List documents error:', error);
+        return edit(ctx, `❌ <b>Gagal membaca collection</b>\n\n${esc(error?.message || 'Firebase error')}`, { reply_markup: { inline_keyboard: [[Markup.button.callback('🔄 Coba Lagi', `ilist.${enc(targetId)}.${enc(collection)}`)], [Markup.button.callback('⬅️ Collections', `inspect_${targetId}`)]] } });
+    }
 });
 
-bot.action(/view_([^_]+)_([^_]+)_(.+)/, async ctx => {
-    const targetId = ctx.match[1];
-    const collection = decodeURIComponent(ctx.match[2]);
-    const documentId = decodeURIComponent(ctx.match[3]);
-    const doc = await TargetDB.getDocument(targetId, collection, documentId);
-    if (!doc) return edit(ctx, '❌ Document tidak ditemukan.', { reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Kembali', `inspect_${targetId}`)]] } });
-    return edit(ctx, `📄 <b>${esc(collection)} / ${esc(doc.id)}</b>\n\n<pre>${esc(short(doc.data))}</pre>`, { reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Kembali', `inspect_${targetId}`)]] } });
+bot.action(/^ilistpage\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/, async ctx => {
+    const targetId = dec(ctx.match[1]);
+    const collection = dec(ctx.match[2]);
+    const cursor = dec(ctx.match[3]);
+    try {
+        const result = await TargetDB.listDocuments(targetId, collection, 10, cursor);
+        const rows = result.docs.map(d => [Markup.button.callback(`📄 ${String(d.id).slice(0, 45)}`, `view.${enc(targetId)}.${enc(collection)}.${enc(d.id)}`)]);
+        if (result.hasMore && result.nextCursor) rows.push([Markup.button.callback('➡️ Berikutnya', `ilistpage.${enc(targetId)}.${enc(collection)}.${enc(result.nextCursor)}`)]);
+        rows.push([Markup.button.callback('⬅️ Collections', `inspect_${targetId}`)]);
+        const text = `📁 <b>${esc(collection)}</b>\n\n${result.docs.length ? result.docs.map((d, i) => `${i + 1}. <code>${esc(d.id)}</code>`).join('\n') : 'Tidak ada document lagi.'}`;
+        return edit(ctx, text, { reply_markup: { inline_keyboard: rows } });
+    } catch (error) {
+        console.error('Document pagination error:', error);
+        return edit(ctx, `❌ <b>Gagal membaca collection</b>\n\n${esc(error?.message || 'Firebase error')}`, { reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Collections', `inspect_${targetId}`)]] } });
+    }
+});
+
+bot.action(/^view\.(.+)$/, async ctx => {
+    const parts = String(ctx.match[1]).split('.');
+    if (parts.length < 3) return ctx.reply('❌ Data document tidak valid.');
+    const targetId = dec(parts.shift());
+    const collection = dec(parts.shift());
+    const documentId = dec(parts.join('.'));
+    try {
+        const doc = await TargetDB.getDocument(targetId, collection, documentId);
+        if (!doc) return edit(ctx, '❌ Document tidak ditemukan.', { reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Kembali', `ilist.${enc(targetId)}.${enc(collection)}`)]] } });
+        return edit(ctx, `📄 <b>${esc(collection)} / ${esc(doc.id)}</b>\n\n<pre>${esc(short(doc.data))}</pre>`, { reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Kembali', `ilist.${enc(targetId)}.${enc(collection)}`)]] } });
+    } catch (error) {
+        console.error('View document error:', error);
+        return edit(ctx, `❌ <b>Gagal membaca document</b>\n\n${esc(error?.message || 'Firebase error')}`, { reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Kembali', `ilist.${enc(targetId)}.${enc(collection)}`)]] } });
+    }
 });
 
 bot.action(/searchdoc_(.+)/, async ctx => {
-    await MainDB.setState(ctx.from.id, { step: 'AWAITING_DOCUMENT_ID', targetId: ctx.match[1] });
+    const targetId = dec(ctx.match[1]);
+    await MainDB.setState(ctx.from.id, { step: 'AWAITING_DOCUMENT_ID', targetId });
     return ctx.reply('🔍 Kirim dalam format:\n<code>collection/documentId</code>', { parse_mode: 'HTML' });
 });
 
-bot.action(/searchfield_([^_]+)_(.+)/, async ctx => {
-    await MainDB.setState(ctx.from.id, { step: 'AWAITING_FIELD_SEARCH', targetId: ctx.match[1], collection: decodeURIComponent(ctx.match[2]) });
+bot.action(/^searchfield\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/, async ctx => {
+    await MainDB.setState(ctx.from.id, { step: 'AWAITING_FIELD_SEARCH', targetId: dec(ctx.match[1]), collection: dec(ctx.match[2]) });
     return ctx.reply('🔍 Kirim dalam format:\n<code>field=value</code>\n\nContoh: <code>email=test@gmail.com</code>', { parse_mode: 'HTML' });
 });
 
