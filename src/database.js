@@ -1,19 +1,14 @@
 const admin = require('firebase-admin');
 const { decrypt } = require('./security');
 
-// Formatting Private Key secara paksa agar kebal dari error Vercel
-let pk = process.env.BOT_FIREBASE_PRIVATE_KEY || '';
-pk = pk.split(String.raw`\n`).join('\n').replace(/\\n/g, '\n');
-
 let mainDb;
 try {
     if (!admin.apps.length) {
+        // Trik baru: Langsung terjemahkan seluruh JSON dari Vercel
+        const serviceAccount = JSON.parse(process.env.BOT_FIREBASE_JSON);
+        
         admin.initializeApp({
-            credential: admin.credential.cert({
-                projectId: process.env.BOT_FIREBASE_PROJECT_ID,
-                clientEmail: process.env.BOT_FIREBASE_CLIENT_EMAIL,
-                privateKey: pk
-            })
+            credential: admin.credential.cert(serviceAccount)
         });
     }
     mainDb = admin.firestore();
