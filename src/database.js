@@ -182,4 +182,4 @@ function normalizeFirebaseError(error) {
 }
 
 module.exports = { MainDB, TargetDB, normalizeFirebaseError };
-            
+    
